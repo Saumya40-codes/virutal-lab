@@ -10,7 +10,10 @@ We start with Firecracker and KVM. Firecracker configures the microVM, loads its
 - Installed Firecracker v1.17.0 in `~/.local/bin`.
 - Started its local API and configured 1 vCPU and 256 MiB guest RAM.
 - Downloaded Linux 6.1.188 and Ubuntu 24.04 userspace, then prepared a 1 GiB ext4 guest disk.
-- Guest boot is the next experiment. Restarting Firecracker clears its API configuration.
+- Booted the guest and reached its root shell through the serial console, without configuring networking.
+- Verified kernel `6.1.188+`, Ubuntu `24.04.5`, 1 available vCPU, 230 MiB usable RAM and the root filesystem mounted at `/`.
+
+Restarting Firecracker clears its API configuration. The disk image persists on the host; persistence across a guest restart has not yet been tested.
 
 ## Files
 
