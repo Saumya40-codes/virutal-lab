@@ -1,7 +1,6 @@
-# Keep notes, exclude downloaded and generated artifacts.
-/downloads/*
-!/downloads/README.md
-/images/*
-!/images/README.md
-/run/*
-!/run/README.md
+# Downloaded and generated artifacts.
+/downloads/
+/images/
+/run/
+/bin/
+/lab
