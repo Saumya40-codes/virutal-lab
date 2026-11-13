@@ -1,0 +1,14 @@
+{
+  "id": "lab-01",
+  "runtime_dir": "run/lab-01",
+  "metrics_addr": "127.0.0.1:9091",
+  "metrics_interval_seconds": 5,
+  "firecracker": "firecracker",
+  "socket": "run/lab-01/firecracker.socket",
+  "kernel": "images/vmlinux-6.1.188",
+  "rootfs": "images/ubuntu-24.04.ext4",
+  "vcpus": 1,
+  "memory_mib": 256,
+  "boot_args": "console=ttyS0 reboot=k panic=0 root=/dev/vda rw",
+  "raw_metrics": false
+}
