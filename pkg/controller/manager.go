@@ -26,11 +26,12 @@ type State struct {
 }
 
 type instance struct {
-	cmd         *exec.Cmd
-	client      *firecracker.Client
-	done        chan struct{}
-	processDone chan struct{}
-	waitErr     error // Read only after done closes.
+	cmd          *exec.Cmd
+	client       *firecracker.Client
+	done         chan struct{}
+	processDone  chan struct{}
+	guestMetrics http.Handler
+	waitErr      error // Read only after done closes.
 }
 
 type manager struct {
@@ -83,6 +84,13 @@ func (m *manager) start(ctx context.Context) (*instance, error) {
 		return nil, err
 	}
 	logger := m.logger.With("guest_session", filepath.Base(session))
+	var vsockPath string
+	if m.cfg.GuestMetrics {
+		vsockPath = filepath.Join(session, "vsock.sock")
+		if len(vsockPath) > 107 {
+			return nil, errors.New("vsock Unix socket path exceeds 107 bytes; shorten runtime_dir")
+		}
+	}
 	logPath := filepath.Join(session, "firecracker.log")
 	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
@@ -136,6 +144,9 @@ func (m *manager) start(ctx context.Context) (*instance, error) {
 		return nil, err
 	}
 	inst := &instance{cmd: cmd, client: client, done: make(chan struct{}), processDone: make(chan struct{})}
+	if m.cfg.GuestMetrics {
+		inst.guestMetrics = newGuestMetricsProxy(vsockPath, logger)
+	}
 	m.mu.Lock()
 	m.current = inst
 	m.state = State{ID: m.cfg.ID, State: "Starting", PID: cmd.Process.Pid, Session: session}
@@ -187,6 +198,7 @@ func (m *manager) start(ctx context.Context) (*instance, error) {
 		BootArgs:  m.cfg.BootArgs,
 		VCPUs:     m.cfg.VCPUs,
 		MemoryMiB: m.cfg.MemoryMiB,
+		VSockPath: vsockPath,
 	}
 	if err := client.Configure(ctx, boot, logPath, metricsPath); err != nil {
 		return abort(err)
@@ -276,4 +288,28 @@ func (m *manager) activePID() (int, error) {
 	default:
 		return m.current.cmd.Process.Pid, nil
 	}
+}
+
+func (m *manager) guestMetricsHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		var proxy http.Handler
+		if m.cfg.GuestMetrics && !m.closing && m.current != nil && m.state.State == "Running" {
+			select {
+			case <-m.current.processDone:
+			default:
+				proxy = m.current.guestMetrics
+			}
+		}
+		m.mu.Unlock()
+		w.Header().Set("Cache-Control", "no-store")
+		if proxy == nil {
+			http.Error(w, "guest metrics require an enabled, running VM", http.StatusServiceUnavailable)
+			return
+		}
+		// Bound the entire scrape, including a guest that stalls in its body.
+		ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+		defer cancel()
+		proxy.ServeHTTP(w, r.WithContext(ctx))
+	})
 }

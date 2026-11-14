@@ -1,11 +1,13 @@
 package firecracker
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"reflect"
 	"strings"
@@ -18,10 +20,10 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestConfigureBootOrderAndFailure(t *testing.T) {
-	for _, failAt := range []string{"", "/logger", "/metrics", "/boot-source"} {
+	for _, failAt := range []string{"", "/logger", "/metrics", "/boot-source", "/vsock"} {
 		t.Run("failure="+failAt, func(t *testing.T) {
 			var paths []string
-			c := BootConfig{Kernel: "/kernel", Rootfs: "/disk", VCPUs: 1, MemoryMiB: 256}
+			c := BootConfig{Kernel: "/kernel", Rootfs: "/disk", VCPUs: 1, MemoryMiB: 256, VSockPath: "/vsock.sock"}
 			client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				paths = append(paths, r.URL.Path)
 				if r.Method != http.MethodPut || r.Header.Get("Content-Type") != "application/json" {
@@ -52,6 +54,10 @@ func TestConfigureBootOrderAndFailure(t *testing.T) {
 					if body["path_on_host"] != c.Rootfs || body["is_read_only"] != false {
 						t.Fatal(body)
 					}
+				case "/vsock":
+					if body["guest_cid"] != float64(3) || body["uds_path"] != c.VSockPath {
+						t.Fatal(body)
+					}
 				case "/actions":
 					if body["action_type"] != "InstanceStart" {
 						t.Fatal(body)
@@ -64,7 +70,7 @@ func TestConfigureBootOrderAndFailure(t *testing.T) {
 				return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(response)), Header: make(http.Header)}, nil
 			})}
 			err := (&Client{HTTP: client}).Configure(context.Background(), c, "/logs", "/metrics")
-			want := []string{"/logger", "/metrics", "/machine-config", "/boot-source", "/drives/rootfs", "/actions"}
+			want := []string{"/logger", "/metrics", "/machine-config", "/boot-source", "/drives/rootfs", "/vsock", "/actions"}
 			if failAt != "" {
 				if err == nil || !strings.Contains(err.Error(), "rejected") {
 					t.Fatalf("expected API failure, got %v", err)
@@ -82,6 +88,89 @@ func TestConfigureBootOrderAndFailure(t *testing.T) {
 				t.Fatalf("requests %v, want %v", paths, want)
 			}
 		})
+	}
+}
+
+func TestConfigureWithoutVSock(t *testing.T) {
+	client := &Client{HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/vsock" {
+			t.Fatal("configured vsock when guest metrics are disabled")
+		}
+		return &http.Response{StatusCode: 204, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+	})}}
+	if err := client.Configure(context.Background(), BootConfig{}, "/logs", "/metrics"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVSockHandshakePreservesBufferedResponse(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	release := make(chan struct{})
+	defer close(release)
+	want := "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nmetrics"
+	go func() {
+		defer server.Close()
+		line, err := bufio.NewReader(server).ReadString('\n')
+		if err != nil || line != "CONNECT 9100\n" {
+			t.Errorf("connect request: %q, %v", line, err)
+			return
+		}
+		// The assigned host port differs from the requested guest port. HTTP
+		// bytes can arrive in the same read as this acknowledgement.
+		_, _ = io.WriteString(server, "OK 1073741824\n"+want)
+		<-release
+	}()
+	conn, err := connectVSock(context.Background(), client, 9100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	got := make([]byte, len(want))
+	_, err = io.ReadFull(conn, got)
+	if err != nil || string(got) != want {
+		t.Fatalf("HTTP stream: %q, %v", got, err)
+	}
+}
+
+func TestVSockHandshakeRejectsMalformedAcknowledgement(t *testing.T) {
+	for _, response := range []string{"", "NO 9100\n", "OK nope\n", "OK 4294967296\n", strings.Repeat("x", 100) + "\n"} {
+		t.Run(fmt.Sprintf("response=%q", response), func(t *testing.T) {
+			client, server := net.Pipe()
+			defer client.Close()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				defer server.Close()
+				_, _ = bufio.NewReader(server).ReadString('\n')
+				_, _ = io.WriteString(server, response)
+			}()
+			conn, err := connectVSock(context.Background(), client, 9100)
+			if err == nil || conn != nil {
+				t.Fatalf("accepted response %q", response)
+			}
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("failed handshake left its connection open")
+			}
+		})
+	}
+}
+
+func TestVSockHandshakeCancellation(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		defer server.Close()
+		_, _ = bufio.NewReader(server).ReadString('\n')
+		cancel()
+		_, _ = io.Copy(io.Discard, server)
+	}()
+	if conn, err := connectVSock(ctx, client, 9100); !errors.Is(err, context.Canceled) || conn != nil {
+		t.Fatalf("cancelled handshake: %v, %v", conn, err)
 	}
 }
 

@@ -70,13 +70,14 @@ func TestManagerRestartsGuestAndRetainsMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := &manager{
-		cfg:     Config{ID: "test-vm", Firecracker: helper, Socket: filepath.Join(dir, "vmm.sock"), Kernel: kernel, Rootfs: disk, VCPUs: 1, MemoryMiB: 256, MetricsIntervalSeconds: 1},
+		cfg:     Config{ID: "test-vm", Firecracker: helper, Socket: filepath.Join(dir, "vmm.sock"), Kernel: kernel, Rootfs: disk, VCPUs: 1, MemoryMiB: 256, MetricsIntervalSeconds: 1, GuestMetrics: true},
 		session: dir, metrics: metrics, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), state: State{ID: "test-vm", State: "Not started"},
 	}
 	// Replace only HTTP transport; use real child processes and real FIFOs.
 	// This keeps lifecycle tests independent of sandbox network permissions.
 	var apiMu sync.Mutex
 	var writer *os.File
+	var vsockPaths []string
 	m.clientFactory = func(socket string, observe firecracker.Observer) *firecracker.Client {
 		client := firecracker.New(socket, observe)
 		client.HTTP.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
@@ -101,6 +102,19 @@ func TestManagerRestartsGuestAndRetainsMetrics(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
+			}
+			if r.URL.Path == "/vsock" {
+				var input struct {
+					Path string `json:"uds_path"`
+					CID  int    `json:"guest_cid"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+					return nil, err
+				}
+				if input.CID != 3 || !strings.HasPrefix(input.Path, dir+"/") {
+					return nil, fmt.Errorf("unexpected vsock configuration: %+v", input)
+				}
+				vsockPaths = append(vsockPaths, input.Path)
 			}
 			if r.URL.Path == "/actions" {
 				var input struct {
@@ -172,6 +186,9 @@ func TestManagerRestartsGuestAndRetainsMetrics(t *testing.T) {
 				t.Fatalf("missing %q in %s", want, rr)
 			}
 		}
+	}
+	if len(vsockPaths) != 2 || vsockPaths[0] == vsockPaths[1] {
+		t.Fatalf("guest launches shared a vsock socket: %v", vsockPaths)
 	}
 	data, err := os.ReadFile(disk)
 	if err != nil || string(data) != "fixture; do not modify" {
