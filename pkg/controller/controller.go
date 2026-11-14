@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -94,7 +96,7 @@ func run(ctx context.Context, c Config, boot bool) (err error) {
 	if err := os.Chmod(c.ControlSocket(), 0600); err != nil {
 		return err
 	}
-	metricsServer := &http.Server{Handler: metricsHandler(registry, metrics), ReadHeaderTimeout: 3 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	metricsServer := &http.Server{Handler: metricsHandler(registry, metrics, m.guestMetricsHandler()), ReadHeaderTimeout: 3 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 	controlServer := &http.Server{Handler: m.handler(), ReadHeaderTimeout: 3 * time.Second, WriteTimeout: 20 * time.Second, IdleTimeout: 30 * time.Second}
 	serverErrors := make(chan error, 2)
 	for _, pair := range []struct {
@@ -222,6 +224,7 @@ var validID = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
 type Config struct {
 	RawMetrics             bool   `json:"raw_metrics"`
+	GuestMetrics           bool   `json:"guest_metrics"`
 	ID                     string `json:"id"`
 	RuntimeDir             string `json:"runtime_dir"`
 	MetricsAddr            string `json:"metrics_addr"`
@@ -294,12 +297,39 @@ func LoadConfig(path string) (Config, error) {
 func (c Config) ControlSocket() string { return filepath.Join(c.RuntimeDir, "controller.socket") }
 
 // Exporter wiring belongs to controller setup, not the metric definitions.
-func metricsHandler(reg prometheus.Gatherer, metrics *telemetry.Metrics) http.Handler {
+func metricsHandler(reg prometheus.Gatherer, metrics *telemetry.Metrics, guest http.Handler) http.Handler {
 	handler := promhttp.InstrumentHandlerDuration(metrics.MetricsScrapeDuration,
 		promhttp.InstrumentHandlerInFlight(metrics.MetricsScrapesInFlight,
 			promhttp.InstrumentHandlerCounter(metrics.MetricsScrapeRequests,
 				promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))))
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", handler)
+	mux.Handle("GET /guest/metrics", guest)
 	return mux
+}
+
+// The guest endpoint streams Node Exporter's response without ingesting its
+// metrics into the controller registry. Each launch has its own vsock socket.
+func newGuestMetricsProxy(socket string, logger *slog.Logger) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Rewrite: func(r *httputil.ProxyRequest) {
+			r.SetURL(&url.URL{Scheme: "http", Host: "guest"})
+			r.Out.URL.Path = "/metrics"
+			r.Out.URL.RawPath = ""
+			r.Out.URL.RawQuery = ""
+		},
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return firecracker.DialVSock(ctx, socket, 9100)
+			},
+			// Reconnect on every scrape; no idle connections survive guest exit.
+			DisableKeepAlives:     true,
+			ResponseHeaderTimeout: 3 * time.Second,
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			logger.Warn("guest_metrics_proxy_failed", "error", err)
+			http.Error(w, "guest metrics unavailable", http.StatusBadGateway)
+		},
+		ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelWarn),
+	}
 }
